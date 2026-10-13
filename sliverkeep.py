@@ -22,7 +22,8 @@ because that ground was never meant to be in the result.
     python sliverkeep.py parts.geojson --points addresses.geojson --min-area 10000 \\
         --out kept.geojson --apply
 
-Nothing is written without --apply.
+Nothing is written without --apply. The one exception is --self-test, which
+makes a temporary directory for its fixtures and removes it again.
 
 Exit codes: 0 the parts were classified, 2 a file could not be read or
 written, 3 refused, 64 usage error.
@@ -141,6 +142,19 @@ class Report(object):
 
 
 # ------------------------------------------------------------------ geometry
+
+def plain(text):
+    """Text safe to print anywhere: every control or non-ASCII character is
+    shown as an escape (Python's ascii() form), so a point id or status value
+    can neither break a narrow console code page nor drive the terminal."""
+    return ascii(text)[1:-1]
+
+
+def box_ring(x0, y0, w, h):
+    """A closed counter-clockwise rectangle ring, as GeoJSON lists."""
+    return [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h],
+            [x0, y0]]
+
 
 def ring_area(ring):
     """Area a closed lon/lat ring bounds on the sphere, in square metres.
@@ -318,9 +332,15 @@ def load_points(doc, path):
         positions = points_of(geometry, "%s feature %d" % (path, fi))
         if not positions:
             empty += 1
-        props = (feature or {}).get("properties") or {}
+        props = (feature or {}).get("properties")
+        if props is None:
+            props = {}
+        elif not isinstance(props, dict):
+            # RFC 7946 section 3.2: properties is an object or null.
+            raise InputError("%s feature %d: properties is not an object"
+                             % (path, fi))
         fid = (feature or {}).get("id")
-        label = "#%d" % fi if fid is None else str(fid)
+        label = "#%d" % fi if fid is None else plain(str(fid))
         for x, y in positions:
             points.append(Point(fi, label, x, y, props))
     return points, empty
@@ -367,7 +387,7 @@ def filter_status(points, field, values):
             if field in p.properties
             and status_key(p.properties[field]) in wanted]
     unmatched = [v for v in wanted if v not in seen]
-    shown = " or ".join("'%s'" % v for v in wanted)
+    shown = " or ".join("'%s'" % plain(v) for v in wanted)
     line = "%s = %s matches %d of %d point(s)" % (field, shown, len(kept),
                                                   len(points))
     if unmatched:
@@ -377,16 +397,25 @@ def filter_status(points, field, values):
         else:
             ranked = sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))
             details.append("values seen in %s: %s" % (field, ", ".join(
-                "'%s' %d" % kv for kv in ranked[:LIFECYCLE_VALUES_SHOWN])))
+                "'%s' %d" % (plain(kv[0]), kv[1])
+                for kv in ranked[:LIFECYCLE_VALUES_SHOWN])))
             for v in unmatched:
                 for s in sorted(seen):
                     if s.lower() == v.lower():
                         details.append("'%s' differs from '%s' only in case"
-                                       % (s, v))
+                                       % (plain(s), plain(v)))
         details.append("Without the points this value should keep, every "
                        "part they hold would be dropped. Nothing was written.")
         raise Refused("the status value %s matches no point"
-                      % " and ".join("'%s'" % v for v in unmatched), details)
+                      % " and ".join("'%s'" % plain(v) for v in unmatched),
+                      details)
+    # A value that matched is no proof the spelling is right: a point written
+    # in another case is silently outside the filter. Name it, do not refuse.
+    near = ["'%s' %d" % (plain(s), seen[s]) for s in sorted(seen)
+            if s not in wanted
+            and any(s.lower() == w.lower() for w in wanted)]
+    if near:
+        line += "; not counted, differs only in case: " + ", ".join(near)
     return kept, line
 
 
@@ -432,6 +461,34 @@ def decide(parts, points, mask, min_area):
              "written."])
 
 
+def check_extent(parts, used, min_area):
+    """Refuse when no evidence point lies in the parts layer's bounding box.
+
+    Longitude and latitude swapped in one file, or a point layer from another
+    place, still pass the range check, and then no point can reach any part:
+    every small part is dropped, the verdict looks normal, and nothing is
+    wrong with the arithmetic. Only a layer with a part under the threshold
+    depends on the points, so only that layer is checked.
+    """
+    if not any(p.area < min_area for p in parts):
+        return
+    boxes = [p.bbox for p in parts]
+    layer = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+             max(b[2] for b in boxes), max(b[3] for b in boxes))
+    if any(in_bbox(pt.x, pt.y, layer) for pt in used):
+        return
+    seen = (min(pt.x for pt in used), min(pt.y for pt in used),
+            max(pt.x for pt in used), max(pt.y for pt in used))
+    raise Refused(
+        "no evidence point lies inside the extent of the parts layer",
+        ["parts extent: longitude %.5f to %.5f, latitude %.5f to %.5f" % (
+            layer[0], layer[2], layer[1], layer[3]),
+         "point extent: longitude %.5f to %.5f, latitude %.5f to %.5f" % (
+             seen[0], seen[2], seen[1], seen[3]),
+         "A layer written latitude first, or a point layer for another area, "
+         "would drop every small part. Nothing was written."])
+
+
 def run(parts, points, mask, min_area, status_field=None, status_values=()):
     """The whole decision, from loaded layers to a Report. No I/O."""
     if not (min_area > 0 and math.isfinite(min_area)):
@@ -439,6 +496,7 @@ def run(parts, points, mask, min_area, status_field=None, status_values=()):
                          % min_area)
     used, status_line = filter_status(points, status_field, status_values)
     decide(parts, used, mask, min_area)
+    check_extent(parts, used, min_area)
     return Report(parts, min_area, len(points), len(used), status_line,
                   len(mask), size_gap(parts, min_area))
 
@@ -511,16 +569,20 @@ def filtered_doc(doc, parts):
 
     Every member the input carried (ids, properties, foreign members) is kept,
     and each geometry keeps its type. A feature whose every part was dropped
-    leaves the collection. Coordinates are copied, never rewound or rounded.
+    leaves the collection; one that never held a part stays. Coordinates are
+    copied, never rewound or rounded.
     """
-    keep = {}
+    keep, held = {}, set()
     for p in parts:
+        held.add(p.feature)
         if p.verdict != DROP:
             keep.setdefault(p.feature, []).append(p.index)
 
     def geometry_for(fi, geometry):
-        if geometry is None:
-            return None
+        # A geometry with no part (null, or an empty MultiPolygon) had nothing
+        # dropped, so it is carried through as it came.
+        if geometry is None or fi not in held:
+            return geometry
         kept = keep.get(fi, [])
         if not kept:
             return False
@@ -548,6 +610,45 @@ def filtered_doc(doc, parts):
         out["geometry"] = geometry_for(0, doc.get("geometry"))
         return out
     return geometry_for(0, doc)
+
+
+# ----------------------------------------------------------------------- demo
+
+def demo_layers():
+    """(parts, addresses, mask): the synthetic layers the README runs against.
+
+    One MultiPolygon with six parts: a big one with a hole, the smallest part
+    over a 10,000 m2 threshold, the largest part under it (1.10x smaller), a
+    small pocket with a live address, a retired address in the near-miss part,
+    and two shards on the mask's edge, one holding an address that lies in the
+    mask. The self-test runs the README's commands over these and compares
+    the output line by line.
+    """
+    parts = {"type": "FeatureCollection", "features": [{
+        "type": "Feature", "id": "remainder",
+        "properties": {"name": "remainder"},
+        "geometry": {"type": "MultiPolygon", "coordinates": [
+            [box_ring(10.0, 0.0, 0.02, 0.02),
+             box_ring(10.005, 0.005, 0.004, 0.004)],
+            [box_ring(10.03, 0.0, 0.00081, 0.001)],
+            [box_ring(10.04, 0.0, 0.000736, 0.001)],
+            [box_ring(10.05, 0.0, 0.0004, 0.0004)],
+            [box_ring(10.0201, 0.0, 0.00002, 0.0004)],
+            [box_ring(10.0201, 0.0005, 0.00002, 0.0004)]]}}]}
+    addresses = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "id": ident, "properties": {"LIFECYCLE": status},
+         "geometry": {"type": "Point", "coordinates": xy}}
+        for ident, status, xy in [
+            ("a-101", "CURRENT", [10.0502, 0.0002]),
+            ("a-102", "CURRENT", [10.01, 0.01]),
+            ("a-103", "RETIRED", [10.0403, 0.0005]),
+            ("a-104", "CURRENT", [10.020115, 0.0007]),
+            ("a-105", "CURRENT", [10.0, 0.03])]]}
+    mask = {"type": "FeatureCollection", "features": [{
+        "type": "Feature", "properties": {},
+        "geometry": {"type": "Polygon",
+                     "coordinates": [box_ring(10.02011, 0.0, 0.006, 0.006)]}}]}
+    return parts, addresses, mask
 
 
 # ------------------------------------------------------------------ self-test
@@ -592,10 +693,7 @@ def self_test():
                 return exc.code
         return None
 
-    def box(x0, y0, w, h):
-        """A closed counter-clockwise rectangle ring, as GeoJSON lists."""
-        return [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h],
-                [x0, y0]]
+    box = box_ring
 
     def tup(ring):
         return [tuple(p) for p in ring]
@@ -652,8 +750,10 @@ def self_test():
           "a slanted edge splits inside from outside correctly")
     check(in_bbox(0.5, 0.5, (0, 0, 1, 1)) and not in_bbox(2, 0.5, (0, 0, 1, 1)),
           "the bounding box prefilter passes inside and rejects outside")
-    check(not on_segment(3.0, 0.0, (0.0, 0.0), (2.0, 0.0)),
-          "a collinear point past the segment's end is not on it")
+    check(not on_segment(3.0, 0.0, (0.0, 0.0), (2.0, 0.0))
+          and not on_segment(0.0, 2.0, (0.0, 0.0), (0.0, 1.0)),
+          "a collinear point past the segment's end is not on it, whether "
+          "the segment runs along x or along y")
 
     # --- GeoJSON reading
     where = "t"
@@ -730,6 +830,20 @@ def self_test():
     pts, empty = load_points(bare, where)
     check(pts[0].label == "#0" and empty == 0,
           "a bare point with no id is labelled by its position in the file")
+    for bad_props in ([1, 2], 5, "text"):
+        raises(lambda: load_points({"type": "Feature", "properties": bad_props,
+                                    "geometry": bare}, where),
+               "a point whose properties is %r is refused, not a traceback"
+               "  <-- pinned defect" % (bad_props,), InputError)
+    check(plain("a\x1b[2Jb") == "a\\x1b[2Jb"
+          and plain("\u0414\u2192") == "\\u0414\\u2192"
+          and plain("live-1") == "live-1",
+          "control and non-ASCII characters print as escapes, plain text "
+          "does not  <-- pinned defect")
+    pts, _ = load_points({"type": "Feature", "id": "a\u2192\x1b",
+                          "geometry": bare}, where)
+    check(pts[0].label == "a\\u2192\\x1b",
+          "a point id is escaped when it is read")
 
     # --- status filter
     pop = [pt("p1", 0, 0, LIFECYCLE="CURRENT"), pt("p2", 0, 0, LIFECYCLE="CURRENT "),
@@ -748,6 +862,20 @@ def self_test():
     kept, line = filter_status(pop, None, [])
     check(len(kept) == 5 and line is None,
           "with no status field every point is evidence")
+    kept, line = filter_status(pop, "LIFECYCLE", [" CURRENT "])
+    check([p.label for p in kept] == ["p1", "p2"]
+          and line == "LIFECYCLE = 'CURRENT' matches 2 of 5 point(s)",
+          "a --status-value is trimmed before it is compared  <-- pinned "
+          "defect")
+    mixed = pop + [pt("p6", 0, 0, LIFECYCLE="Current")]
+    kept, line = filter_status(mixed, "LIFECYCLE", ["CURRENT"])
+    check(len(kept) == 2 and line == "LIFECYCLE = 'CURRENT' matches 2 of 6 "
+          "point(s); not counted, differs only in case: 'Current' 1",
+          "a value that matches some points still names the points it missed "
+          "by case  <-- pinned defect")
+    kept, line = filter_status(mixed, "LIFECYCLE", ["CURRENT", "Current"])
+    check(len(kept) == 3 and "differs" not in line,
+          "and says nothing when the other spelling is a value you named")
     exc = refusal(lambda: filter_status(pop, "LIFECYCLE", ["Current"]))
     check(exc is not None,
           "a status value that matches nothing refuses the run"
@@ -832,6 +960,9 @@ def self_test():
           "the status line is printed")
     check(lines[-1].startswith("VERDICT: keep 3 part(s), drop 2 sliver(s)"),
           "the verdict line counts kept and dropped parts")
+    check(lines[-1] == "VERDICT: keep 3 part(s), drop 2 sliver(s) totalling "
+          "%.1f m2." % (under.area + shard.area),
+          "and totals the area of the dropped parts only  <-- pinned defect")
     quiet = describe(report, 0)
     check(not any("dropped, largest first" in ln or "kept for the points" in ln
                   for ln in quiet),
@@ -886,6 +1017,63 @@ def self_test():
     check(empty_report.parts == [] and empty_report.gap is None,
           "a parts layer with no parts classifies nothing and refuses nothing")
 
+    # --- the thresholds and the edges, through decide()
+    eq = Part(0, 0, [tup(box(10.02, 0.0, 0.001, 0.001))])
+    inside = pt("in-big", 10.005, 0.005)
+    run([eq], [inside], [], eq.area)
+    check(eq.verdict == KEEP_SIZE,
+          "a part whose area equals the threshold is kept for its size"
+          "  <-- pinned defect")
+    run([eq, big], [inside], [], eq.area * 1.0000001)
+    check(eq.verdict == DROP and big.verdict == KEEP_SIZE,
+          "and a threshold a hair above drops it")
+    check(size_gap([pocket, eq], eq.area) == (pocket.area, eq.area),
+          "the size gap counts a part at the threshold as over it, not under"
+          "  <-- pinned defect")
+    rect = Part(0, 0, [tup(box(10.0, 0.0, 0.001, 0.001))])
+    edge_verdicts = []
+    for name, x, y in (("left", 10.0, 0.0005), ("right", 10.001, 0.0005),
+                       ("bottom", 10.0005, 0.0), ("top", 10.0005, 0.001),
+                       ("corner", 10.001, 0.001)):
+        run([rect], [pt(name, x, y)], [], 1.0e6)
+        edge_verdicts.append(rect.verdict)
+    check(edge_verdicts == [KEEP_POINTS] * 5,
+          "a point on any edge or vertex of a part, which is also its "
+          "bounding box edge, keeps the part  <-- pinned defect")
+    half = [[tup(box(10.0, 0.0, 0.0005, 0.001))]]
+    run([rect], [pt("seam", 10.0005, 0.0005)], half, 1.0e6)
+    check(rect.verdict == KEEP_POINTS and rect.masked == 0,
+          "a point on the mask's edge stays evidence through decide()"
+          "  <-- pinned defect")
+    exc = refusal(lambda: run([rect], [pt("under-mask", 10.0004, 0.0005)],
+                              half, 1.0e6))
+    check(exc is not None and rect.masked == 1,
+          "while a point inside the mask is not")
+
+    # --- the extent of the parts layer
+    layer = [big, pocket]
+    swapped = [pt("swapped", 0.00015, 10.04015)]
+    exc = refusal(lambda: run(layer, swapped, [], 10000.0))
+    check(exc is not None and "extent of the parts layer" in exc.reason
+          and any("parts extent: longitude 10.00000 to 10.04030" in d
+                  for d in exc.details),
+          "points that lie outside the parts layer's extent refuse the run, "
+          "with both extents shown  <-- pinned defect")
+    exc = refusal(lambda: run(layer, [pt("elsewhere", 0.5, 0.5)], [],
+                              10000.0))
+    check(exc is not None and "extent" in exc.reason,
+          "a point layer for another place is refused the same way")
+    exc = refusal(lambda: run(layer, [pt("old", 10.04015, 0.00015,
+                                         LIFECYCLE="RETIRED"),
+                                      pt("far", 50.0, 50.0,
+                                         LIFECYCLE="CURRENT")], [], 10000.0,
+                              "LIFECYCLE", ["CURRENT"]))
+    check(exc is not None and "extent" in exc.reason,
+          "only the points the status filter keeps count toward the extent")
+    run(layer, [pt("live", 10.04015, 0.00015)], [], 10000.0)
+    check(pocket.verdict == KEEP_POINTS,
+          "one point in the extent is enough to run")
+
     # --- the output document
     holed_mp = {"type": "MultiPolygon",
                 "coordinates": [[box(10.0, 0.0, 0.01, 0.01)],
@@ -929,6 +1117,23 @@ def self_test():
     run(gp, [pt("x", 50.0, 50.0)], [], 10000.0)
     check(filtered_doc(geom, gp) == geom,
           "a bare geometry comes back as a bare geometry")
+    hollow = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"k": 1},
+         "geometry": {"type": "MultiPolygon", "coordinates": []}},
+        {"type": "Feature", "properties": {},
+         "geometry": {"type": "Polygon",
+                      "coordinates": [box(10.0, 0.0, 0.01, 0.01)]}}]}
+    hp = load_parts(hollow, "h")
+    run(hp, [pt("x", 50.0, 50.0)], [], 10000.0)
+    hout = filtered_doc(hollow, hp)
+    check(len(hout["features"]) == 2 and hout["features"][0] == hollow[
+        "features"][0],
+          "a feature whose MultiPolygon is empty had nothing dropped and "
+          "stays  <-- pinned defect")
+    empty_mp = {"type": "MultiPolygon", "coordinates": []}
+    check(filtered_doc(empty_mp, []) == empty_mp,
+          "a bare empty MultiPolygon comes back as it came, not as false"
+          "  <-- pinned defect")
     nogeom = {"type": "Feature", "properties": {}, "geometry": None}
     check(filtered_doc(nogeom, [])["geometry"] is None,
           "a Feature with no geometry comes back with none")
@@ -1082,6 +1287,180 @@ def self_test():
                                  "--min-area", "10000"])
         check(code == 0 and "KEEP_POINTS  2" in out_text,
               "a file with a UTF-8 BOM reads the same as one without")
+        # The README's demo runs, line for line.
+        d_parts, d_addr, d_mask = demo_layers()
+        dp = put("demo-parts.geojson", d_parts)
+        da = put("demo-addresses.geojson", d_addr)
+        dm = put("demo-removed.geojson", d_mask)
+        gap = ("size gap: the largest part under the threshold is 9120.5 m2 "
+               "and the smallest part over it is 10037.5 m2, 1.10x apart. "
+               "Size alone does not separate them; the points are deciding.")
+        head = ["threshold parts under 10000.0 m2 are slivers unless an "
+                "address point lies inside them", "parts classified: 6"]
+        code, out_text, _ = cli([dp, "--points", da, "--min-area", "10000"])
+        check(code == 0 and out_text.split("\n")[1:] == head + [
+            "  KEEP_SIZE    2", "  KEEP_POINTS  3", "  DROP         1", "",
+            "kept for the points inside them, smallest first:",
+            "  feature 0 part 5             99.1 m2  1 point(s): a-104",
+            "  feature 0 part 3           1982.7 m2  1 point(s): a-101",
+            "  feature 0 part 2           9120.5 m2  1 point(s): a-103", "",
+            "dropped, largest first:",
+            "  feature 0 part 4             99.1 m2", "", gap, "",
+            "VERDICT: keep 5 part(s), drop 1 sliver(s) totalling 99.1 m2.",
+            ""],
+              "the README's first demo run prints exactly what it quotes")
+        named = [dp, "--points", da, "--min-area", "10000", "--mask", dm,
+                 "--status-field", "LIFECYCLE", "--status-value", "CURRENT"]
+        code, out_text, _ = cli(named)
+        check(code == 0 and out_text.split("\n")[1:] == [
+            "status    LIFECYCLE = 'CURRENT' matches 4 of 5 point(s)",
+            "mask      1 polygon(s). A point inside them is not evidence."
+            ] + head + [
+            "  KEEP_SIZE    2", "  KEEP_POINTS  1", "  DROP         3", "",
+            "kept for the points inside them, smallest first:",
+            "  feature 0 part 3           1982.7 m2  1 point(s): a-101", "",
+            "dropped, largest first:",
+            "  feature 0 part 2           9120.5 m2",
+            "  feature 0 part 4             99.1 m2",
+            "  feature 0 part 5             99.1 m2  (1 point(s) inside, all "
+            "in the mask)", "", gap,
+            "points inside a small part but also inside the mask, not "
+            "counted as evidence: 1", "",
+            "VERDICT: keep 3 part(s), drop 3 sliver(s) totalling 9318.8 m2.",
+            ""],
+              "and the second, with the status filter and the mask")
+        code, out_text, _ = cli(named + ["--sample", "1"])
+        check("feature 0 part 3 " in out_text
+              and "feature 0 part 2 " in out_text
+              and "feature 0 part 4 " not in out_text
+              and "feature 0 part 5 " not in out_text,
+              "--sample 1 lists the largest dropped part and no other"
+              "  <-- pinned defect")
+        code, out_text, _ = cli([dp, "--points", da, "--min-area", "10000",
+                                 "--sample", "1"])
+        check("feature 0 part 5 " in out_text
+              and "feature 0 part 3 " not in out_text
+              and "feature 0 part 2 " not in out_text,
+              "and --sample 1 lists the smallest kept part and no other"
+              "  <-- pinned defect")
+        d_out = os.path.join(tmp, "demo-kept.geojson")
+        code, out_text, _ = cli(named + ["--out", d_out])
+        check(code == 0 and out_text.split("\n")[-2] == (
+            "Check only. %s was not written. Re-run with --apply." % d_out),
+              "the third demo run says it only checked")
+        code, out_text, _ = cli(named[:-1] + ["Current", "--out", d_out,
+                                              "--apply"])
+        check(code == 3 and out_text.split("\n")[1:] == [
+            "REFUSED   the status value 'Current' matches no point",
+            "      LIFECYCLE = 'Current' matches 0 of 5 point(s)",
+            "      values seen in LIFECYCLE: 'CURRENT' 4, 'RETIRED' 1",
+            "      'CURRENT' differs from 'Current' only in case",
+            "      Without the points this value should keep, every part "
+            "they hold would be dropped. Nothing was written.", "",
+            "VERDICT: REFUSED", ""] and not os.path.exists(d_out),
+              "and the refusal prints exactly what the README quotes")
+        near = put("demo-near.geojson", dict(d_addr, features=d_addr[
+            "features"][:4] + [{"type": "Feature", "id": "a-106",
+                                "properties": {"LIFECYCLE": "Current"},
+                                "geometry": {"type": "Point",
+                                             "coordinates": [10.0, 0.03]}}]))
+        code, out_text, _ = cli(named[:2] + [near] + named[3:])
+        check(code == 0 and "matches 3 of 5 point(s); not counted, differs "
+              "only in case: 'Current' 1" in out_text,
+              "a status value that matched some points names the ones it "
+              "missed by case  <-- pinned defect")
+
+        # A point layer in the wrong place is refused, not read as no evidence.
+        swp = put("swapped.geojson", {"type": "Point",
+                                      "coordinates": [0.00015, 10.04015]})
+        code, out_text, _ = cli([parts_path, "--points", swp, "--min-area",
+                                 "10000", "--out", out_path, "--apply"])
+        check(code == 3 and "extent of the parts layer" in out_text
+              and not os.path.exists(out_path),
+              "latitude-first points exit 3 and write nothing, even with "
+              "--apply  <-- pinned defect")
+
+        # --out may not name any input, by any route to the same file.
+        for flag, target in (("--points", pts_path), ("--mask", mask_path)):
+            before = io.open(target, encoding="utf-8").read()
+            code, _, err_text = cli(base + ["--mask", mask_path, "--out",
+                                            target, "--apply"])
+            check(code == 64 and "input" in err_text
+                  and io.open(target, encoding="utf-8").read() == before,
+                  "--out naming the %s file is a usage error and the file is "
+                  "untouched  <-- pinned defect" % flag[2:])
+        link = os.path.join(tmp, "parts-link.geojson")
+        os.link(parts_path, link)
+        code, _, err_text = cli(base + ["--out", link, "--apply"])
+        with open(parts_path) as handle:
+            check(code == 64 and "input" in err_text
+                  and json.load(handle) == coll,
+                  "--out naming a hard link to an input file is a usage "
+                  "error  <-- pinned defect")
+        dotted = os.path.join(tmp, "..", os.path.basename(tmp),
+                              "parts.geojson")
+        code, _, err_text = cli(base + ["--out", dotted, "--apply"])
+        with open(parts_path) as handle:
+            check(code == 64 and json.load(handle) == coll,
+                  "and so is a path to the input that goes through .. "
+                  "<-- pinned defect")
+
+        # --out replaces what is there, and a document that cannot be written
+        # leaves it alone.
+        old = put("old.geojson", "x" * 4000)
+        code, _, _ = cli(base + ["--out", old, "--apply"])
+        with open(old) as handle:
+            check(code == 0 and json.load(handle)["type"] == "FeatureCollection",
+                  "--out over an existing file replaces it, it does not "
+                  "append  <-- pinned defect")
+        nan_doc = dict(coll)
+        nan_doc["extra"] = float("nan")
+        nan_path = put("nan.geojson", nan_doc)
+        precious = put("precious.geojson", "precious")
+        code, _, err_text = cli([nan_path, "--points", pts_path, "--min-area",
+                                 "10000", "--out", precious, "--apply"])
+        with open(precious) as handle:
+            check(code == 2 and "could not write" in err_text
+                  and handle.read() == "precious",
+                  "a NaN in a foreign member exits 2 and leaves --out "
+                  "untouched  <-- pinned defect")
+        deep = put("deep.geojson", "[" * 100000)
+        code, _, err_text = cli([deep, "--points", pts_path, "--min-area",
+                                 "5"])
+        check(code == 2 and "deep.geojson" in err_text,
+              "a file nested 100,000 levels deep exits 2, not a traceback"
+              "  <-- pinned defect")
+        bad_props = put("bad-props.geojson", {"type": "Feature",
+                                              "properties": [1],
+                                              "geometry": {
+                                                  "type": "Point",
+                                                  "coordinates": [10.0, 0.0]}})
+        code, _, err_text = cli(base[:2] + [bad_props] + base[3:] + [
+            "--status-field", "LIFECYCLE", "--status-value", "CURRENT"])
+        check(code == 2 and "properties is not an object" in err_text,
+              "a point whose properties is a list exits 2, not a traceback"
+              "  <-- pinned defect")
+        uni = put("uni.geojson", {"type": "Feature", "id": "a\u2192\x1b[2J",
+                                  "properties": {"LIFECYCLE": "\u0414"},
+                                  "geometry": {"type": "Point", "coordinates":
+                                               [10.04015, 0.00015]}})
+        code, out_text, _ = cli([parts_path, "--points", uni, "--min-area",
+                                 "10000"])
+        body = out_text.split("\n", 1)[1]
+        check(code == 0 and "a\\u2192\\x1b[2J" in body
+              and all(ord(c) < 128 and (ord(c) >= 32 or c == "\n")
+                      for c in body),
+              "a point id with an arrow and an escape code prints as plain "
+              "ASCII  <-- pinned defect")
+        code, out_text, _ = cli([parts_path, "--points", uni, "--min-area",
+                                 "10000", "--status-field", "LIFECYCLE",
+                                 "--status-value", "\u0425"])
+        body = out_text.split("\n", 1)[1]
+        check(code == 3 and "'\\u0414' 1" in body
+              and all(ord(c) < 128 for c in body),
+              "and so does a refusal that lists a Cyrillic status value"
+              "  <-- pinned defect")
+
         slivers = put("slivers.geojson", {"type": "Polygon", "coordinates": [
             box(10.06, 0.0, 0.0001, 0.0001)]})
         far_path = put("far.geojson", {"type": "Point",
@@ -1148,14 +1527,16 @@ def read_json(path):
     with io.open(path, "r", encoding="utf-8-sig") as handle:
         try:
             return json.load(handle)
-        except ValueError as exc:
-            # json's own message has no file name in it.
+        except (ValueError, RecursionError) as exc:
+            # json's own message has no file name in it. RecursionError is a
+            # file nested too deep to parse, which is unusable input too.
             raise InputError("%s: not JSON: %s" % (path, exc))
 
 
 def same_file(a, b):
-    return (os.path.normcase(os.path.realpath(a))
-            == os.path.normcase(os.path.realpath(b)))
+    # samefile sees through hard links, symlinks, case and relative paths. A
+    # path that does not exist yet cannot be an input that was read.
+    return os.path.exists(a) and os.path.exists(b) and os.path.samefile(a, b)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -1173,7 +1554,8 @@ def _parse(argv):
         description="Drop sliver parts from a GeoJSON polygon layer, but keep "
                     "every part that holds an address point.",
         epilog="All layers are GeoJSON in WGS 84 longitude/latitude. Nothing "
-               "is written without --apply.",
+               "is written without --apply (except --self-test's own "
+               "temporary directory).",
         allow_abbrev=False,
     )
     ap.add_argument("parts", nargs="?", metavar="PARTS",
@@ -1195,7 +1577,8 @@ def _parse(argv):
     ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
                     help="how many parts to list under each heading "
                          "(default %d)" % DEFAULT_SAMPLE)
-    ap.add_argument("--out", help="path for the cleaned GeoJSON")
+    ap.add_argument("--out", help="path for the cleaned GeoJSON. Only "
+                                  "written with --apply")
     ap.add_argument("--apply", action="store_true",
                     help="write --out. Without this nothing is written.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
@@ -1277,9 +1660,13 @@ def main(argv=None):
     if args.out:
         if args.apply:
             try:
+                # Serialise first: a document that cannot be written (NaN in
+                # a foreign member, nested too deep) must not truncate --out.
+                text = json.dumps(filtered_doc(parts_doc, parts),
+                                  allow_nan=False)
                 with io.open(args.out, "w", encoding="utf-8") as handle:
-                    json.dump(filtered_doc(parts_doc, parts), handle)
-            except (IOError, OSError) as exc:
+                    handle.write(text)
+            except (IOError, OSError, ValueError, RecursionError) as exc:
                 print("error: could not write %s: %s" % (args.out, exc),
                       file=sys.stderr)
                 return 2
